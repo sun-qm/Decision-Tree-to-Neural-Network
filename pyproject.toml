@@ -19,6 +19,9 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = [
+  "numpy>=1.23",
+]
 
 [project.scripts]
 dt-to-nn-demo = "dt_to_nn.demo:main"
