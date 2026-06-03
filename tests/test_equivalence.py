@@ -11,6 +11,7 @@ from dt_to_nn import (
     threshold_probe_samples,
 )
 from dt_to_nn.trainable import one_hot
+from dt_to_nn.visualization import render_network_svg, render_tree_svg
 
 import numpy as np
 
@@ -111,6 +112,18 @@ class TreeToNNEquivalenceTest(unittest.TestCase):
         self.assertTrue(np.isfinite(before))
         self.assertTrue(np.isfinite(after))
         self.assertEqual(len(history.losses), 5)
+
+    def test_visualization_renders_svg(self):
+        tree = demo_tree()
+        network = convert_tree_to_network(tree)
+
+        tree_svg = render_tree_svg(tree, sample=[0.6, 1.2, 0.0])
+        network_svg = render_network_svg(network, n_features=3, sample=[0.6, 1.2, 0.0])
+
+        self.assertIn("<svg", tree_svg)
+        self.assertIn("Decision Tree Structure", tree_svg)
+        self.assertIn("Neural Network Architecture", network_svg)
+        self.assertIn("line", network_svg)
 
 
 if __name__ == "__main__":

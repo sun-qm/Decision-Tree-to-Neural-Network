@@ -61,6 +61,12 @@ Direct-path parser 对比：
 .venv/bin/python -m examples.compare_direct_path
 ```
 
+生成 decision tree 和 neural network 的 SVG 可视化：
+
+```bash
+.venv/bin/python -m examples.visualize_demo
+```
+
 ## 使用示例
 
 ```python
@@ -132,6 +138,7 @@ dt_to_nn/
   converter.py   # Tree-to-NN 转换算法
   direct_path_converter.py
   evaluation.py  # 一致性评估工具
+  visualization.py
   trainable.py   # 可微 parsed NN 和 zero-padding 训练
   torch_trainable.py
   paper_evaluation.py

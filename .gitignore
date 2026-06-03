@@ -10,4 +10,5 @@ htmlcov/
 venv/
 dist/
 build/
+artifacts/
 .DS_Store
