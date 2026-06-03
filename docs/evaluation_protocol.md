@@ -46,12 +46,21 @@ Run:
 python3 -m examples.paper_style_evaluation
 ```
 
+For the fuller evaluation, install the optional dependencies or use the
+project virtual environment:
+
+```bash
+python3 -m pip install -e ".[evaluation]"
+python3 -m examples.paper_style_evaluation
+```
+
 The key fields are:
 
 - `equivalence_to_input_tree`: whether the parsed network exactly reproduces the tree.
 - `tree_or_exact_parsed_nn`: the tree and exact parsed NN have identical dataset performance.
 - `zero_padded_parsed_before_training`: soft differentiable parsed model before training.
 - `zero_padded_parsed_after_training`: performance after zero padding and training.
+- `threshold_only_enhancement`: PyTorch training with only first-layer threshold biases unfrozen.
 - `random_dense_after_training` and `random_sparse_after_training`: same architecture but without tree-informed placement.
 
 Finite dataset training can improve accuracy against ground-truth labels, but after training the network is no longer guaranteed to remain exactly equivalent to the original tree. This is expected: zero padding and training are used to increase model capacity beyond the user-authored rule tree.

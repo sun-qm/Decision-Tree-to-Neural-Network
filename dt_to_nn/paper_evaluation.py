@@ -13,6 +13,17 @@ from dt_to_nn.evaluation import evaluate_equivalence, random_samples, threshold_
 from dt_to_nn.trainable import TrainableParsedNetwork, one_hot
 from dt_to_nn.tree import DecisionNode, Leaf, predict_batch
 
+try:  # Optional evaluation dependencies.
+    from sklearn.metrics import accuracy_score, precision_score, recall_score
+    from sklearn.model_selection import train_test_split
+    from sklearn.tree import DecisionTreeClassifier
+
+    from dt_to_nn.torch_trainable import TorchParsedNetwork, train_torch_model
+
+    HAS_SKLEARN_TORCH = True
+except Exception:  # pragma: no cover - exercised when optional deps are absent.
+    HAS_SKLEARN_TORCH = False
+
 
 @dataclass(frozen=True)
 class Metrics:
@@ -94,6 +105,29 @@ def fixed_splits(
     return splits
 
 
+def sklearn_fixed_splits(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    folds: int = 5,
+    test_fraction: float = 0.2,
+    seed: int = 11,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Five fixed 80/20 splits using scikit-learn."""
+
+    indices = np.arange(len(x))
+    splits = []
+    for fold in range(folds):
+        train, test = train_test_split(
+            indices,
+            test_size=test_fraction,
+            random_state=seed + fold,
+            stratify=y,
+        )
+        splits.append((train, test))
+    return splits
+
+
 def classification_metrics(
     y_true: Sequence[Any],
     y_pred: Sequence[Any],
@@ -101,6 +135,18 @@ def classification_metrics(
     *,
     loss: float | None = None,
 ) -> Metrics:
+    if HAS_SKLEARN_TORCH:
+        return Metrics(
+            accuracy=float(accuracy_score(y_true, y_pred)),
+            macro_precision=float(
+                precision_score(y_true, y_pred, labels=list(classes), average="macro", zero_division=0)
+            ),
+            macro_recall=float(
+                recall_score(y_true, y_pred, labels=list(classes), average="macro", zero_division=0)
+            ),
+            loss=loss,
+        )
+
     y_true = list(y_true)
     y_pred = list(y_pred)
     accuracy = sum(a == b for a, b in zip(y_true, y_pred)) / len(y_true)
@@ -130,6 +176,15 @@ def run_paper_style_evaluation(
 ) -> dict[str, Any]:
     """Evaluate exact parsing plus zero-padded training and random baselines."""
 
+    if HAS_SKLEARN_TORCH:
+        return run_sklearn_torch_evaluation(
+            epochs=epochs,
+            learning_rate=learning_rate,
+            zero_padding_width=zero_padding_width,
+            zero_padding_layers=zero_padding_layers,
+            seed=seed,
+        )
+
     tree = build_editable_xai_demo_tree()
     classes = (0, 1)
     x, y = make_nonlinear_classification_data(seed=seed)
@@ -146,6 +201,179 @@ def run_paper_style_evaluation(
         "zero_padded_parsed_after_training": [],
         "random_dense_after_training": [],
         "random_sparse_after_training": [],
+    }
+
+
+def run_sklearn_torch_evaluation(
+    *,
+    epochs: int = 250,
+    learning_rate: float = 0.01,
+    zero_padding_width: int = 4,
+    zero_padding_layers: int = 1,
+    seed: int = 3,
+) -> dict[str, Any]:
+    """Evaluation using scikit-learn metrics/splits and PyTorch training."""
+
+    tree = build_editable_xai_demo_tree()
+    classes = (0, 1)
+    x, y = make_nonlinear_classification_data(seed=seed)
+    labels_from_tree = predict_batch(tree, x)
+    exact_network = convert_tree_to_network(tree, classes=classes)
+
+    probe_samples = random_samples(3, 1000, low=0.0, high=1.0, seed=seed)
+    probe_samples.extend(threshold_probe_samples(tree, epsilon=1e-12))
+    equivalence = evaluate_equivalence(tree, exact_network, probe_samples).to_dict()
+
+    results: dict[str, list[Metrics]] = {
+        "tree_or_exact_parsed_nn": [],
+        "sklearn_decision_tree_trained_on_data": [],
+        "zero_padded_parsed_before_training": [],
+        "zero_padded_parsed_after_training": [],
+        "threshold_only_enhancement": [],
+        "random_dense_after_training": [],
+        "random_sparse_after_training": [],
+    }
+    losses: dict[str, list[list[float]]] = {
+        "zero_padded_parsed_after_training": [],
+        "threshold_only_enhancement": [],
+        "random_dense_after_training": [],
+        "random_sparse_after_training": [],
+    }
+
+    splits = sklearn_fixed_splits(x, y, seed=seed + 100)
+    for fold, (train_idx, test_idx) in enumerate(splits):
+        x_train, x_test = x[train_idx], x[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        y_train_onehot = one_hot(y_train, classes)
+        y_test_onehot = one_hot(y_test, classes)
+
+        tree_pred = [exact_network.predict(row) for row in x_test]
+        results["tree_or_exact_parsed_nn"].append(
+            classification_metrics(y_test, tree_pred, classes)
+        )
+
+        sklearn_tree = DecisionTreeClassifier(max_depth=2, random_state=seed + fold)
+        sklearn_tree.fit(x_train, y_train)
+        results["sklearn_decision_tree_trained_on_data"].append(
+            classification_metrics(y_test, sklearn_tree.predict(x_test), classes)
+        )
+
+        parsed = TorchParsedNetwork.from_tree(
+            tree,
+            classes=classes,
+            n_features=3,
+            zero_padding_width=zero_padding_width,
+            zero_padding_layers=zero_padding_layers,
+        )
+        results["zero_padded_parsed_before_training"].append(
+            classification_metrics(
+                y_test,
+                parsed.predict_numpy(x_test),
+                classes,
+                loss=parsed.loss_numpy(x_test, y_test_onehot),
+            )
+        )
+
+        threshold_model = TorchParsedNetwork.from_tree(
+            tree,
+            classes=classes,
+            n_features=3,
+            zero_padding_width=0,
+            zero_padding_layers=0,
+        )
+        history = train_torch_model(
+            threshold_model,
+            x_train,
+            y_train_onehot,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=64,
+            seed=seed + fold,
+            freeze_except_thresholds=True,
+        )
+        losses["threshold_only_enhancement"].append(history.losses)
+        results["threshold_only_enhancement"].append(
+            classification_metrics(
+                y_test,
+                threshold_model.predict_numpy(x_test),
+                classes,
+                loss=threshold_model.loss_numpy(x_test, y_test_onehot),
+            )
+        )
+
+        history = train_torch_model(
+            parsed,
+            x_train,
+            y_train_onehot,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=64,
+            seed=seed + 100 + fold,
+        )
+        losses["zero_padded_parsed_after_training"].append(history.losses)
+        results["zero_padded_parsed_after_training"].append(
+            classification_metrics(
+                y_test,
+                parsed.predict_numpy(x_test),
+                classes,
+                loss=parsed.loss_numpy(x_test, y_test_onehot),
+            )
+        )
+
+        for mode in ("dense", "sparse"):
+            model_name = f"random_{mode}_after_training"
+            baseline = parsed.clone_random_like(seed=seed + 1000 + fold, mode=mode)
+            history = train_torch_model(
+                baseline,
+                x_train,
+                y_train_onehot,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                batch_size=64,
+                seed=seed + 2000 + fold,
+            )
+            losses[model_name].append(history.losses)
+            results[model_name].append(
+                classification_metrics(
+                    y_test,
+                    baseline.predict_numpy(x_test),
+                    classes,
+                    loss=baseline.loss_numpy(x_test, y_test_onehot),
+                )
+            )
+
+    return {
+        "method_notes": {
+            "paper_2_reference": (
+                "Uses fixed five-fold 80/20 train/test splits, reports "
+                "classification accuracy, macro precision, macro recall, and "
+                "compares parsed initialization against random dense/sparse "
+                "same-architecture baselines."
+            ),
+            "editable_xai_reference": (
+                "Parser follows the CHI 2026 Editable XAI text: paired "
+                "decision-branch neurons, ReLU(p+q-1) for trace conjunction, "
+                "cReLU(sum(paths)) for class disjunction, zero padding with "
+                "zero weights/biases, and cross-entropy backpropagation."
+            ),
+            "implementation": "scikit-learn splits/metrics + PyTorch training",
+        },
+        "equivalence_to_input_tree": equivalence,
+        "tree_accuracy_against_dataset_labels": classification_metrics(
+            y, labels_from_tree, classes
+        ).to_dict(),
+        "cross_validation": _summarize_results(results),
+        "training_loss": _summarize_losses(losses),
+        "config": {
+            "epochs": epochs,
+            "learning_rate": learning_rate,
+            "zero_padding_width": zero_padding_width,
+            "zero_padding_layers": zero_padding_layers,
+            "n_samples": len(x),
+            "n_features": x.shape[1],
+            "folds": len(splits),
+            "backend": "sklearn+torch",
+        },
     }
     losses: dict[str, list[list[float]]] = {
         "zero_padded_parsed_after_training": [],

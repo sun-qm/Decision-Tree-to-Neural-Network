@@ -23,5 +23,11 @@ classifiers = [
 [project.scripts]
 dt-to-nn-demo = "dt_to_nn.demo:main"
 
+[project.optional-dependencies]
+evaluation = [
+  "scikit-learn>=1.4",
+  "torch>=2.0",
+]
+
 [tool.setuptools.packages.find]
 include = ["dt_to_nn*"]
