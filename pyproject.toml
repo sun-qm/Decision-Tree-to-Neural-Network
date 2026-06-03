@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dt-to-nn"
+version = "0.1.0"
+description = "Convert decision trees into topologically equivalent neural networks and evaluate equivalence."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Amy Wang" }
+]
+keywords = ["decision-tree", "neural-network", "equivalence", "interpretable-ml"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+dt-to-nn-demo = "dt_to_nn.demo:main"
+
+[tool.setuptools.packages.find]
+include = ["dt_to_nn*"]
