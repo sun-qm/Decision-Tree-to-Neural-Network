@@ -46,7 +46,13 @@ dt-to-nn-demo
 测试：
 
 ```bash
-python -m unittest discover -s tests
+python3 -m unittest discover -s tests
+```
+
+论文式 evaluation：
+
+```bash
+python3 -m examples.paper_style_evaluation
 ```
 
 ## 使用示例
@@ -99,6 +105,15 @@ print(result.to_dict())
 - 检查阈值相等和阈值两侧的边界行为。
 - 对离散特征空间做完整网格枚举。
 
+## 参考论文的 Evaluation
+
+项目额外提供 [docs/evaluation_protocol.md](/Users/amywang/Documents/DT to NN/docs/evaluation_protocol.md)，把两篇论文里的要求拆成两层：
+
+1. **Editable XAI 算法正确性**：检查 parsed neural network 是否严格复现输入 decision tree。
+2. **DJINN-style 训练表现**：参考 `2.pdf` 的 fixed five-fold 80/20 split、accuracy/precision/recall、training loss、random dense/sparse baseline，并加入 Editable XAI 里的 zero padding 后训练。
+
+注意：zero padding 后继续训练的目标是提高对数据标签的预测表现；训练后网络参数被更新，因此不再保证和原始 tree 完全一致。这和 Editable XAI 的 Enhance 阶段一致：先由 tree 得到可训练的 NN，再通过额外容量和梯度更新提升性能。
+
 ## 项目结构
 
 ```text
@@ -107,6 +122,8 @@ dt_to_nn/
   network.py     # 稀疏神经网络图和前向计算
   converter.py   # Tree-to-NN 转换算法
   evaluation.py  # 一致性评估工具
+  trainable.py   # 可微 parsed NN 和 zero-padding 训练
+  paper_evaluation.py
   demo.py        # 示例
 tests/
   test_equivalence.py

@@ -3,11 +3,15 @@ import unittest
 from dt_to_nn import (
     DecisionNode,
     Leaf,
+    TrainableParsedNetwork,
     convert_tree_to_network,
     evaluate_equivalence,
     random_samples,
     threshold_probe_samples,
 )
+from dt_to_nn.trainable import one_hot
+
+import numpy as np
 
 
 def demo_tree():
@@ -68,6 +72,33 @@ class TreeToNNEquivalenceTest(unittest.TestCase):
         self.assertEqual(summary["max_depth"], 2)
         self.assertEqual(summary["condition_neurons"], 6)
         self.assertEqual(summary["output_neurons"], 3)
+
+    def test_zero_padded_trainable_network_can_train(self):
+        tree = demo_tree()
+        model = TrainableParsedNetwork.from_tree(
+            tree,
+            classes=("A", "B", "C"),
+            n_features=3,
+            zero_padding_width=2,
+            zero_padding_layers=1,
+        )
+        x = np.array(
+            [
+                [0.6, 1.2, 0.0],
+                [0.6, 0.4, 0.0],
+                [0.1, 0.0, -0.5],
+                [0.1, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+        y = one_hot(["A", "B", "C", "B"], ("A", "B", "C"))
+        before = model.loss(x, y)
+        history = model.fit(x, y, epochs=5, learning_rate=0.01, batch_size=2, seed=0)
+        after = model.loss(x, y)
+
+        self.assertTrue(np.isfinite(before))
+        self.assertTrue(np.isfinite(after))
+        self.assertEqual(len(history.losses), 5)
 
 
 if __name__ == "__main__":
