@@ -4,6 +4,7 @@ from dt_to_nn import (
     DecisionNode,
     Leaf,
     TrainableParsedNetwork,
+    convert_tree_to_direct_path_network,
     convert_tree_to_network,
     evaluate_equivalence,
     random_samples,
@@ -64,6 +65,17 @@ class TreeToNNEquivalenceTest(unittest.TestCase):
 
         self.assertTrue(result.is_fully_consistent, result.to_dict())
         self.assertEqual(network.outputs([99.0]), {"only": 1.0})
+
+    def test_direct_path_network_matches_tree_exactly(self):
+        tree = demo_tree()
+        network = convert_tree_to_direct_path_network(tree)
+        samples = random_samples(3, 300, low=-3.0, high=3.0, seed=13)
+        samples.extend(threshold_probe_samples(tree))
+
+        result = evaluate_equivalence(tree, network, samples)
+
+        self.assertTrue(result.is_fully_consistent, result.to_dict())
+        self.assertEqual(result.max_output_error, 0.0)
 
     def test_summary_contains_expected_network_shape(self):
         network = convert_tree_to_network(demo_tree())

@@ -55,6 +55,12 @@ python3 -m unittest discover -s tests
 .venv/bin/python -m examples.paper_style_evaluation
 ```
 
+Direct-path parser 对比：
+
+```bash
+.venv/bin/python -m examples.compare_direct_path
+```
+
 ## 使用示例
 
 ```python
@@ -111,6 +117,7 @@ print(result.to_dict())
 
 1. **Editable XAI 算法正确性**：检查 parsed neural network 是否严格复现输入 decision tree。
 2. **DJINN-style 训练表现**：参考 `2.pdf` 的 fixed five-fold 80/20 split、accuracy/precision/recall、training loss、random dense/sparse baseline，并加入 Editable XAI 里的 threshold-only enhancement 和 zero padding 后 topology enhancement。
+3. **Direct path 结构改进**：见 [docs/direct_path_comparison.md](/Users/amywang/Documents/DT to NN/docs/direct_path_comparison.md)，每条 root-to-leaf path 直接建一个 path neuron，比较它和原递归 AND parser 的结构、严格等价性和训练表现。
 
 当前 enhanced evaluation 优先使用 sklearn 做 split/metrics，使用 PyTorch 做 cross-entropy backpropagation。如果没有安装这些可选依赖，会自动退回到纯 NumPy evaluation。
 
@@ -123,6 +130,7 @@ dt_to_nn/
   tree.py        # 决策树数据结构和预测
   network.py     # 稀疏神经网络图和前向计算
   converter.py   # Tree-to-NN 转换算法
+  direct_path_converter.py
   evaluation.py  # 一致性评估工具
   trainable.py   # 可微 parsed NN 和 zero-padding 训练
   torch_trainable.py

@@ -1,6 +1,10 @@
 """Decision-tree to neural-network conversion utilities."""
 
 from dt_to_nn.converter import TreeToNNConverter, convert_tree_to_network
+from dt_to_nn.direct_path_converter import (
+    DirectPathTreeToNNConverter,
+    convert_tree_to_direct_path_network,
+)
 from dt_to_nn.evaluation import (
     EvaluationResult,
     evaluate_equivalence,
@@ -19,7 +23,9 @@ __all__ = [
     "Leaf",
     "NeuralDecisionNetwork",
     "TrainableParsedNetwork",
+    "DirectPathTreeToNNConverter",
     "TreeToNNConverter",
+    "convert_tree_to_direct_path_network",
     "convert_tree_to_network",
     "evaluate_equivalence",
     "make_grid",
