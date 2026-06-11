@@ -6,7 +6,9 @@ from dt_to_nn import (
     TrainableParsedNetwork,
     convert_tree_to_direct_path_network,
     convert_tree_to_network,
+    convert_tree_to_paper_exact_network,
     evaluate_equivalence,
+    evaluate_paper_exact_agreement,
     random_samples,
     threshold_probe_samples,
 )
@@ -58,6 +60,48 @@ class TreeToNNEquivalenceTest(unittest.TestCase):
 
         self.assertEqual(network.outputs([1.5]), {"false": 0.0, "true": 1.0})
         self.assertEqual(network.predict([1.5]), "true")
+
+    def test_paper_exact_converter_uses_unscaled_sigmoid_parameters(self):
+        tree = DecisionNode(
+            feature_index=0,
+            threshold=1.5,
+            true_child=Leaf("true"),
+            false_child=Leaf("false"),
+        )
+        network = convert_tree_to_paper_exact_network(
+            tree,
+            classes=("false", "true"),
+            n_features=1,
+        )
+
+        self.assertEqual(network.activations, ["sigmoid", "crelu"])
+        first_layer_parameters = {
+            (float(weight[0]), float(bias))
+            for weight, bias in zip(network.weights[0], network.biases[0])
+        }
+        self.assertEqual(
+            first_layer_parameters,
+            {(-1.0, 1.5), (1.0, -1.5)},
+        )
+        self.assertEqual(
+            network.outputs_one([1.5]),
+            {"false": 0.5, "true": 0.5},
+        )
+
+    def test_paper_exact_agreement_is_measured_separately_from_one_hot(self):
+        tree = demo_tree()
+        network = convert_tree_to_paper_exact_network(
+            tree,
+            classes=("A", "B", "C"),
+            n_features=3,
+        )
+        samples = random_samples(3, 1000, low=-2.0, high=2.0, seed=42)
+        result = evaluate_paper_exact_agreement(tree, network, samples)
+
+        self.assertGreater(result.prediction_agreement, 0.90)
+        self.assertLess(result.prediction_agreement, 1.0)
+        self.assertEqual(result.output_vector_agreement, 0.0)
+        self.assertGreater(result.mean_absolute_output_error, 0.0)
 
     def test_single_leaf_tree_is_supported(self):
         tree = Leaf("only")

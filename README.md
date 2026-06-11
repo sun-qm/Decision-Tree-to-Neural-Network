@@ -55,6 +55,22 @@ python3 -m unittest discover -s tests
 .venv/bin/python -m examples.paper_style_evaluation
 ```
 
+严格按照 Editable XAI Eq. (1)-(5) 的 smooth-sigmoid 版本及一致率：
+
+```bash
+.venv/bin/python -m examples.evaluate_paper_exact
+```
+
+这个版本与原来的硬阈值版本并存：
+
+- `convert_tree_to_network()` 使用硬 branch indicator，目标是与 DT 严格预测等价。
+- `convert_tree_to_paper_exact_network()` 第一层严格使用论文的
+  `sigmoid(+x_j-tau)` / `sigmoid(-x_j+tau)`，权重不额外乘 temperature。
+
+论文公式版在参数和激活函数上忠实于论文，但 smooth sigmoid 会产生连续值，
+所以不保证预测标签 100% 一致，也不保证输出是精确 one-hot。专用 evaluation
+会分别报告随机样本、threshold probes 和合并样本上的预测一致率与输出误差。
+
 Direct-path parser 对比：
 
 ```bash
@@ -136,6 +152,8 @@ dt_to_nn/
   tree.py        # 决策树数据结构和预测
   network.py     # 稀疏神经网络图和前向计算
   converter.py   # Tree-to-NN 转换算法
+  paper_exact_converter.py  # 严格按照论文 smooth-sigmoid 公式
+  paper_exact_evaluation.py # 论文公式版 DT/NN 一致率
   direct_path_converter.py
   evaluation.py  # 一致性评估工具
   visualization.py
