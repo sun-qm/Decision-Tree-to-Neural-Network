@@ -442,6 +442,40 @@ class NeuralEnsemble(nn.Module):
         return outputs.mean(dim=0)
 
 
+class TBNN(nn.Module):
+    """
+    Tree-Based Neural Network (Ivanova & Kubat style simplified version)
+    """
+
+    def __init__(self, estimator, task, output_dim, seed=0):
+        super().__init__()
+        set_all_seeds(seed)
+
+        self.task = task
+
+        # 1. extract tree structure
+        self.paths = extract_sklearn_paths(
+            estimator,
+            task=task,
+            output_dim=output_dim
+        )
+
+        # 2. build same structure as SoftTreeNetwork
+        self.model = SoftTreeNetwork(
+            self.paths,
+            alpha=5.0,              # paper-style sharpness
+            mode="editable",
+            seed=seed
+        )
+
+        # 3. optional: small refinement layer (paper idea = extra links)
+        self.refine = nn.Linear(output_dim, output_dim)
+
+    def forward(self, x):
+        out = self.model(x)
+        return self.refine(out)
+
+
 def count_parameters(model: nn.Module) -> tuple[int, int]:
     total = 0
     nonzero = 0
@@ -634,6 +668,8 @@ def make_model(
     if model_name == "mlp":
         width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
         return MLPBaseline(paths.n_features, output_dim, width=width, seed=seed)
+    if model_name == "tbnn":
+        return TBNN(estimator, task=task, output_dim=output_dim, seed=seed)
     raise ValueError(f"unknown neural model: {model_name}")
 
 
@@ -1097,7 +1133,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["source_tree", "coexplain_soft", "same_arch_random", "djinn", "path_expansion", "mlp"],
+        default=["source_tree", "coexplain_soft", "same_arch_random", "djinn", "path_expansion", "mlp", "tbnn"],
     )
     parser.add_argument("--alphas", nargs="+", type=float, default=[5.0, 20.0])
     parser.add_argument("--split-seeds", nargs="+", type=int, default=[0])
