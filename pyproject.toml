@@ -25,6 +25,7 @@ dependencies = [
 
 [project.scripts]
 dt-to-nn-demo = "dt_to_nn.demo:main"
+dt-to-nn-performance = "dt_to_nn.performance_baselines:main"
 
 [project.optional-dependencies]
 evaluation = [

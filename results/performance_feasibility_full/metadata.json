@@ -1,0 +1,39 @@
+{
+  "python": "(3, 9, 6)",
+  "torch": "2.8.0",
+  "sklearn_datasets": [
+    "diabetes",
+    "california_housing",
+    "wine",
+    "breast_cancer"
+  ],
+  "settings": [
+    "single_tree",
+    "ensemble_10"
+  ],
+  "models": [
+    "source_tree",
+    "coexplain_soft",
+    "same_arch_random",
+    "djinn",
+    "path_expansion",
+    "mlp"
+  ],
+  "alphas": [
+    0.5,
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    50.0,
+    100.0
+  ],
+  "split_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+}

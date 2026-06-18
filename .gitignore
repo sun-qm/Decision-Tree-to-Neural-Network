@@ -6,9 +6,11 @@ __pycache__/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+.cache/
 .venv/
 venv/
 dist/
 build/
 artifacts/
+results/performance_smoke*/
 .DS_Store

@@ -83,6 +83,32 @@ Direct-path parser 对比：
 .venv/bin/python -m examples.visualize_demo
 ```
 
+Performance feasibility baselines:
+
+```bash
+.venv/bin/python -m examples.run_performance_experiment \
+  --datasets diabetes breast_cancer \
+  --settings single_tree \
+  --models source_tree coexplain_soft same_arch_random djinn path_expansion mlp \
+  --alphas 5 20 \
+  --split-seeds 0
+```
+
+结果会写到 `results/performance_feasibility/`，包含 per-epoch loss、
+per-run summary、model size、alpha sensitivity 和 validation-selected alpha 表。
+
+Full grid entry point:
+
+```bash
+.venv/bin/python -m examples.run_all_performance
+```
+
+默认 full grid 包含 4 个数据集、single-tree / 10-tree ensemble、5 个 split 和
+alpha grid `[0.5, 1, 2, 5, 10, 20, 50, 100]`，并使用 `--stream-results`
+持续刷新 CSV。California Housing 默认抽样到 2500 条以便本地 feasibility run；
+若要使用 sklearn 全量数据，可运行 `examples.run_performance_experiment` 并加
+`--no-dataset-cap`。
+
 ## 使用示例
 
 ```python
@@ -154,6 +180,7 @@ dt_to_nn/
   converter.py   # Tree-to-NN 转换算法
   paper_exact_converter.py  # 严格按照论文 smooth-sigmoid 公式
   paper_exact_evaluation.py # 论文公式版 DT/NN 一致率
+  performance_baselines.py  # soft parser / DJINN / EntropyNet-like performance baselines
   direct_path_converter.py
   evaluation.py  # 一致性评估工具
   visualization.py
