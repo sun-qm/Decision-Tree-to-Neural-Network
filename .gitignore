@@ -12,5 +12,5 @@ venv/
 dist/
 build/
 artifacts/
-results/performance_smoke*/
+results/performance*smoke*/
 .DS_Store
