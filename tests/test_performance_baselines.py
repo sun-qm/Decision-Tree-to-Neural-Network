@@ -10,9 +10,9 @@ try:
         CoExplainZeroPaddedNetwork,
         DJINNSparseFixedNetwork,
         DJINNLikeNetwork,
+        PBNNNetwork,
         KBANNNetwork,
         LSUVNetwork,
-        PBNNNetwork,
         SoftTreeNetwork,
         choose_mlp_width,
         count_layers,
@@ -68,6 +68,22 @@ class PerformanceBaselineTest(unittest.TestCase):
 
         self.assertEqual(tuple(output.shape), (len(x), 2))
         self.assertGreaterEqual(count_layers(model), 2)
+
+    def test_djinn_sparse_fixed_keeps_zero_weights_zero(self):
+        x, tree = self._tiny_classifier()
+        model = DJINNSparseFixedNetwork(tree, task="classification", output_dim=2, seed=0)
+        zero_masks = [layer.weight.detach().eq(0.0).clone() for layer in model.layers]
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        y = torch.as_tensor([0, 0, 1, 1, 0, 1], dtype=torch.long)
+
+        optimizer.zero_grad()
+        loss = torch.nn.functional.cross_entropy(model(torch.as_tensor(x)), y)
+        loss.backward()
+        optimizer.step()
+        model.apply_constraints()
+
+        for layer, zero_mask in zip(model.layers, zero_masks):
+            self.assertTrue(torch.all(layer.weight.detach()[zero_mask] == 0.0))
 
     def test_zero_padded_coexplain_forward_shape(self):
         x, tree = self._tiny_classifier()
@@ -155,22 +171,6 @@ class PerformanceBaselineTest(unittest.TestCase):
         self.assertEqual(count_layers(model), 3)
         for variance in model.initial_variances:
             self.assertLess(abs(variance - 1.0), 0.1)
-
-    def test_djinn_sparse_fixed_keeps_zero_weights_zero(self):
-        x, tree = self._tiny_classifier()
-        model = DJINNSparseFixedNetwork(tree, task="classification", output_dim=2, seed=0)
-        zero_masks = [layer.weight.detach().eq(0.0).clone() for layer in model.layers]
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-        y = torch.as_tensor([0, 0, 1, 1, 0, 1], dtype=torch.long)
-
-        optimizer.zero_grad()
-        loss = torch.nn.functional.cross_entropy(model(torch.as_tensor(x)), y)
-        loss.backward()
-        optimizer.step()
-        model.apply_constraints()
-
-        for layer, zero_mask in zip(model.layers, zero_masks):
-            self.assertTrue(torch.all(layer.weight.detach()[zero_mask] == 0.0))
 
     def test_parameter_matched_width_is_close_to_target(self):
         width = choose_mlp_width(n_features=4, output_dim=2, target_params=120)
