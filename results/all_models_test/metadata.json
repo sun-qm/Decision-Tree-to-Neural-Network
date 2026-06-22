@@ -3,6 +3,7 @@
   "torch": "2.12.1",
   "sklearn_datasets": [
     "diabetes",
+    "wine",
     "breast_cancer"
   ],
   "settings": [
