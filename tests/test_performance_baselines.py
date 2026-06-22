@@ -10,6 +10,7 @@ try:
         CoExplainZeroPaddedNetwork,
         DJINNSparseFixedNetwork,
         DJINNLikeNetwork,
+        PBNNNetwork,
         SoftTreeNetwork,
         choose_mlp_width,
         count_layers,
@@ -83,6 +84,39 @@ class PerformanceBaselineTest(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (len(x), 2))
         self.assertGreater(count_layers(model), 3)
         self.assertGreater(count_neurons(model), count_neurons(SoftTreeNetwork(paths, alpha=5.0, mode="editable")))
+
+    def test_pbnn_trains_on_binary_patterns_and_prunes(self):
+        x, tree = self._tiny_classifier()
+        model = PBNNNetwork(
+            tree,
+            output_dim=2,
+            pretrain_steps=15,
+            penalty_steps=10,
+            seed=0,
+        )
+
+        output = model(torch.as_tensor(x))
+        self.assertEqual(tuple(output.shape), (len(x), 2))
+        self.assertEqual(model.num_binary_patterns, model.total_binary_patterns)
+        self.assertEqual(count_layers(model), 3)
+        self.assertEqual(
+            count_neurons(model),
+            len(model.active_interval_indices)
+            + model.hidden_layer.out_features
+            + 2,
+        )
+
+        hidden_zeros = model._hidden_weight_mask == 0
+        output_zeros = model._output_weight_mask == 0
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        optimizer.zero_grad()
+        torch.nn.functional.cross_entropy(
+            output, torch.tensor([0, 0, 1, 1, 0, 1])
+        ).backward()
+        optimizer.step()
+        model.apply_constraints()
+        self.assertTrue(torch.all(model.hidden_layer.weight[hidden_zeros] == 0))
+        self.assertTrue(torch.all(model.output_layer.weight[output_zeros] == 0))
 
     def test_djinn_sparse_fixed_keeps_zero_weights_zero(self):
         x, tree = self._tiny_classifier()

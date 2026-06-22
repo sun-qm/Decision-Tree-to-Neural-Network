@@ -847,6 +847,280 @@ def make_tbnn(
     )
 
 
+class PBNNNetwork(nn.Module):
+    """Setiono-Leow pruning-based neural network initialized from a tree.
+
+    The source tree defines mutually exclusive attribute intervals and labels
+    every valid binary interval pattern. A fully-connected one-hidden-layer
+    network is fitted to those patterns with L-BFGS (a quasi-Newton method),
+    then connections and redundant units are removed with a saturating
+    penalty from the N2P2F family of pruning methods.
+    """
+
+    def __init__(
+        self,
+        estimator: Any,
+        *,
+        output_dim: int,
+        max_binary_patterns: int = 8192,
+        pretrain_steps: int = 75,
+        penalty_steps: int = 50,
+        penalty_strength: float = 1e-4,
+        penalty_sharpness: float = 10.0,
+        ridge_strength: float = 1e-6,
+        prune_threshold: float = 0.05,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        if not isinstance(estimator, DecisionTreeClassifier):
+            raise TypeError("PBNN requires a fitted DecisionTreeClassifier")
+        if max_binary_patterns <= 0:
+            raise ValueError("max_binary_patterns must be positive")
+        if pretrain_steps < 0 or penalty_steps < 0:
+            raise ValueError("pretraining step counts must be non-negative")
+        if penalty_strength < 0.0 or ridge_strength < 0.0:
+            raise ValueError("penalty strengths must be non-negative")
+        if penalty_sharpness <= 0.0 or prune_threshold < 0.0:
+            raise ValueError("penalty_sharpness must be positive and prune_threshold non-negative")
+
+        set_all_seeds(seed)
+        self.task = "classification"
+        self.output_dim = output_dim
+        paths = extract_sklearn_paths(estimator, task="classification", output_dim=output_dim)
+        interval_features, interval_centers, interval_widths, feature_intervals = (
+            TBNNNetwork._make_intervals(paths)
+        )
+        if not feature_intervals:
+            raise ValueError("PBNN requires a tree with at least one decision node")
+
+        self.register_buffer(
+            "interval_features", torch.as_tensor(interval_features, dtype=torch.long)
+        )
+        self.register_buffer(
+            "interval_centers", torch.as_tensor(interval_centers, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "interval_widths", torch.as_tensor(interval_widths, dtype=torch.float32)
+        )
+        self._group_features = sorted(feature_intervals)
+        self._group_ranges: list[tuple[int, int]] = []
+        for group_id, feature in enumerate(self._group_features):
+            indices = feature_intervals[feature]
+            start, end = indices[0], indices[-1] + 1
+            self._group_ranges.append((start, end))
+            cuts = interval_centers[start : end - 1] + interval_widths[start : end - 1] / 2.0
+            self.register_buffer(
+                f"_interval_cuts_{group_id}", torch.as_tensor(cuts, dtype=torch.float32)
+            )
+
+        hidden_width = max(1, paths.leaf_count)
+        self.hidden_layer = nn.Linear(len(interval_features), hidden_width)
+        self.output_layer = nn.Linear(hidden_width, output_dim)
+        self._reset_parameters(seed)
+
+        patterns, targets = self._binary_training_patterns(
+            estimator,
+            feature_intervals,
+            interval_centers,
+            max_binary_patterns=max_binary_patterns,
+            seed=seed,
+        )
+        self.num_binary_patterns = len(patterns)
+        self.total_binary_patterns = int(
+            math.prod(len(feature_intervals[feature]) for feature in self._group_features)
+        )
+        pattern_tensor = torch.as_tensor(patterns, dtype=torch.float32)
+        target_tensor = torch.as_tensor(targets, dtype=torch.long)
+        self._fit_patterns(
+            pattern_tensor,
+            target_tensor,
+            steps=pretrain_steps,
+            penalty_strength=0.0,
+            penalty_sharpness=penalty_sharpness,
+            ridge_strength=0.0,
+        )
+        self._fit_patterns(
+            pattern_tensor,
+            target_tensor,
+            steps=penalty_steps,
+            penalty_strength=penalty_strength,
+            penalty_sharpness=penalty_sharpness,
+            ridge_strength=ridge_strength,
+        )
+        self._compress_and_mask(prune_threshold)
+
+    def _reset_parameters(self, seed: int) -> None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        with torch.no_grad():
+            for layer in (self.hidden_layer, self.output_layer):
+                bound = math.sqrt(6.0 / max(1, layer.in_features + layer.out_features))
+                layer.weight.uniform_(-bound, bound, generator=generator)
+                layer.bias.zero_()
+
+    @staticmethod
+    def _binary_training_patterns(
+        estimator: Any,
+        feature_intervals: dict[int, list[int]],
+        interval_centers: np.ndarray,
+        *,
+        max_binary_patterns: int,
+        seed: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        features = sorted(feature_intervals)
+        sizes = [len(feature_intervals[feature]) for feature in features]
+        total = int(math.prod(sizes))
+        if total <= max_binary_patterns:
+            combinations = np.asarray(list(np.ndindex(*sizes)), dtype=np.int64)
+        else:
+            rng = np.random.default_rng(seed)
+            flat = np.sort(rng.choice(total, size=max_binary_patterns, replace=False))
+            combinations = np.empty((len(flat), len(sizes)), dtype=np.int64)
+            remainder = flat.copy()
+            for col in range(len(sizes) - 1, -1, -1):
+                combinations[:, col] = remainder % sizes[col]
+                remainder //= sizes[col]
+
+        n_intervals = sum(sizes)
+        patterns = np.zeros((len(combinations), n_intervals), dtype=np.float32)
+        source_inputs = np.full(
+            (len(combinations), int(estimator.n_features_in_)), 0.5, dtype=np.float32
+        )
+        for group, feature in enumerate(features):
+            indices = np.asarray(feature_intervals[feature], dtype=np.int64)
+            selected = indices[combinations[:, group]]
+            patterns[np.arange(len(patterns)), selected] = 1.0
+            source_inputs[:, feature] = interval_centers[selected]
+
+        predicted = estimator.predict(source_inputs)
+        class_to_index = {label: idx for idx, label in enumerate(estimator.classes_)}
+        targets = np.asarray([class_to_index[label] for label in predicted], dtype=np.int64)
+        return patterns, targets
+
+    def _fit_patterns(
+        self,
+        patterns: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        steps: int,
+        penalty_strength: float,
+        penalty_sharpness: float,
+        ridge_strength: float,
+    ) -> None:
+        if steps == 0:
+            return
+        optimizer = torch.optim.LBFGS(
+            self.parameters(),
+            lr=1.0,
+            max_iter=steps,
+            tolerance_grad=1e-7,
+            tolerance_change=1e-9,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure() -> torch.Tensor:
+            optimizer.zero_grad()
+            logits = self.output_layer(torch.tanh(self.hidden_layer(patterns)))
+            loss = F.cross_entropy(logits, targets)
+            if penalty_strength or ridge_strength:
+                weights = (self.hidden_layer.weight, self.output_layer.weight)
+                compact = sum(
+                    (
+                        penalty_sharpness
+                        * weight.square()
+                        / (1.0 + penalty_sharpness * weight.square())
+                    ).sum()
+                    for weight in weights
+                )
+                ridge = sum(weight.square().sum() for weight in weights)
+                loss = loss + penalty_strength * compact + ridge_strength * ridge
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+
+    def _compress_and_mask(self, threshold: float) -> None:
+        with torch.no_grad():
+            hidden_mask = self.hidden_layer.weight.abs() >= threshold
+            output_mask = self.output_layer.weight.abs() >= threshold
+            for output in range(self.output_dim):
+                if not output_mask[output].any():
+                    strongest = int(self.output_layer.weight[output].abs().argmax().item())
+                    output_mask[output, strongest] = True
+
+            hidden_active = output_mask.any(dim=0) & (
+                hidden_mask.any(dim=1) | (self.hidden_layer.bias.abs() >= threshold)
+            )
+            if not hidden_active.any():
+                strongest = int(self.output_layer.weight.abs().sum(dim=0).argmax().item())
+                hidden_active[strongest] = True
+            active_hidden = torch.nonzero(hidden_active, as_tuple=False).flatten()
+
+            input_active = hidden_mask[active_hidden].any(dim=0)
+            if not input_active.any():
+                strongest = int(
+                    self.hidden_layer.weight[active_hidden].abs().sum(dim=0).argmax().item()
+                )
+                input_active[strongest] = True
+            active_inputs = torch.nonzero(input_active, as_tuple=False).flatten()
+
+            new_hidden = nn.Linear(len(active_inputs), len(active_hidden))
+            new_output = nn.Linear(len(active_hidden), self.output_dim)
+            new_hidden.weight.copy_(self.hidden_layer.weight[active_hidden][:, active_inputs])
+            new_hidden.bias.copy_(self.hidden_layer.bias[active_hidden])
+            new_output.weight.copy_(self.output_layer.weight[:, active_hidden])
+            new_output.bias.copy_(self.output_layer.bias)
+
+            hidden_keep = hidden_mask[active_hidden][:, active_inputs]
+            output_keep = output_mask[:, active_hidden]
+            new_hidden.weight.mul_(hidden_keep)
+            new_output.weight.mul_(output_keep)
+            self.hidden_layer = new_hidden
+            self.output_layer = new_output
+            self.register_buffer("active_interval_indices", active_inputs)
+            self.register_buffer("_hidden_weight_mask", hidden_keep.float())
+            self.register_buffer("_output_weight_mask", output_keep.float())
+            self.hidden_layer.weight.register_hook(
+                lambda grad: grad * self._hidden_weight_mask
+            )
+            self.output_layer.weight.register_hook(
+                lambda grad: grad * self._output_weight_mask
+            )
+            self.apply_constraints()
+
+    def interval_memberships(self, x: torch.Tensor) -> torch.Tensor:
+        memberships = torch.zeros(
+            (len(x), len(self.interval_features)), dtype=x.dtype, device=x.device
+        )
+        rows = torch.arange(len(x), device=x.device)
+        for group_id, (feature, (start, _)) in enumerate(
+            zip(self._group_features, self._group_ranges)
+        ):
+            cuts = getattr(self, f"_interval_cuts_{group_id}")
+            bins = torch.bucketize(x[:, feature].contiguous(), cuts, right=False)
+            memberships[rows, start + bins] = 1.0
+        return memberships[:, self.active_interval_indices]
+
+    def apply_constraints(self) -> None:
+        with torch.no_grad():
+            self.hidden_layer.weight.mul_(self._hidden_weight_mask)
+            self.output_layer.weight.mul_(self._output_weight_mask)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        intervals = self.interval_memberships(x)
+        return self.output_layer(torch.tanh(self.hidden_layer(intervals)))
+
+
+def make_pbnn(
+    estimator: Any,
+    *,
+    output_dim: int,
+    seed: int = 0,
+) -> PBNNNetwork:
+    """Build a PBNN from a fitted classification tree."""
+    return PBNNNetwork(estimator, output_dim=output_dim, seed=seed)
+
+
 def count_parameters(model: nn.Module) -> tuple[int, int]:
     total = 0
     nonzero = 0
@@ -865,6 +1139,12 @@ def count_neurons(model: nn.Module) -> int:
         return sum(count_neurons(member) for member in model.members)
     if isinstance(model, TBNNNetwork):
         return (len(model.interval_features) + model.and_layer.out_features + model.or_layer.out_features)
+    if isinstance(model, PBNNNetwork):
+        return (
+            len(model.active_interval_indices)
+            + model.hidden_layer.out_features
+            + model.output_layer.out_features
+        )
     total = 0
     for module in model.modules():
         if isinstance(module, nn.Linear):
@@ -879,6 +1159,8 @@ def count_layers(model: nn.Module) -> int:
         return len(model.layers)
     if isinstance(model, NeuralEnsemble):
         return sum(count_layers(member) for member in model.members)
+    if isinstance(model, (TBNNNetwork, PBNNNetwork)):
+        return 3
     return sum(1 for module in model.modules() if isinstance(module, nn.Linear))
 
 
@@ -1065,6 +1347,10 @@ def make_model(
                 "the paper does not specify a regression mapping."
             )
         return make_tbnn(estimator, output_dim=output_dim, seed=seed)
+    if model_name == "pbnn":
+        if task != "classification":
+            raise ValueError("The Setiono-Leow PBNN baseline is classification-only.")
+        return make_pbnn(estimator, output_dim=output_dim, seed=seed)
     raise ValueError(f"unknown neural model: {model_name}")
 
 
@@ -1261,9 +1547,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 for model_name in args.models:
                     if model_name == "source_tree":
                         continue
-                    if model_name == "tbnn" and task != "classification":
+                    if model_name in {"tbnn", "pbnn"} and task != "classification":
                         if getattr(args, "verbose", False):
-                            print("      [skip] tbnn is classification-only", flush=True)
+                            print(
+                                f"      [skip] {model_name} is classification-only",
+                                flush=True,
+                            )
                         continue
                     alpha_values: list[float | None] = (
                         list(args.alphas)
@@ -1577,7 +1866,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["source_tree", "coexplain_soft", "same_arch_random", "djinn", "path_expansion", "mlp", "tbnn"],
+        default=["source_tree", "coexplain_soft", "same_arch_random", "djinn", "path_expansion", "mlp", "tbnn", "pbnn"],
     )
     parser.add_argument("--alphas", nargs="+", type=float, default=[5.0, 20.0])
     parser.add_argument("--split-seeds", nargs="+", type=int, default=[0])
