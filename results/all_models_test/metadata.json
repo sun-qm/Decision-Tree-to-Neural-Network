@@ -1,0 +1,35 @@
+{
+  "python": "(3, 13, 5)",
+  "torch": "2.12.1",
+  "sklearn_datasets": [
+    "diabetes",
+    "breast_cancer"
+  ],
+  "settings": [
+    "single_tree",
+    "ensemble_10"
+  ],
+  "models": [
+    "source_tree",
+    "coexplain_soft",
+    "coexplain_soft_zero_padded",
+    "same_arch_random",
+    "djinn",
+    "djinn_sparse_fixed",
+    "path_expansion",
+    "mlp",
+    "lsuv",
+    "tbnn",
+    "pbnn",
+    "kbann"
+  ],
+  "alphas": [
+    5.0,
+    20.0
+  ],
+  "split_seeds": [
+    0
+  ],
+  "max_samples": 300,
+  "no_dataset_cap": false
+}
