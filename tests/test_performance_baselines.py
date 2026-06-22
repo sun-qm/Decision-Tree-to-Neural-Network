@@ -10,6 +10,8 @@ try:
         CoExplainZeroPaddedNetwork,
         DJINNSparseFixedNetwork,
         DJINNLikeNetwork,
+        KBANNNetwork,
+        LSUVNetwork,
         PBNNNetwork,
         SoftTreeNetwork,
         choose_mlp_width,
@@ -117,6 +119,42 @@ class PerformanceBaselineTest(unittest.TestCase):
         model.apply_constraints()
         self.assertTrue(torch.all(model.hidden_layer.weight[hidden_zeros] == 0))
         self.assertTrue(torch.all(model.output_layer.weight[output_zeros] == 0))
+
+    def test_kbann_maps_tree_rules_to_network(self):
+        x, tree = self._tiny_classifier()
+        model = KBANNNetwork(tree, output_dim=2, perturbation=0.0, seed=0)
+
+        with torch.no_grad():
+            output = model(torch.as_tensor(x))
+
+        self.assertEqual(tuple(output.shape), (len(x), 2))
+        self.assertEqual(count_layers(model), 3)
+        self.assertEqual(
+            count_neurons(model),
+            model.num_fact_units + model.paths.leaf_count + 2,
+        )
+        self.assertTrue(
+            torch.equal(output.argmax(dim=1), torch.as_tensor(tree.predict(x)))
+        )
+
+    def test_lsuv_produces_unit_variance_layers(self):
+        x, _ = self._tiny_classifier()
+        model = LSUVNetwork(
+            n_features=2,
+            output_dim=2,
+            width=6,
+            calibration_x=x,
+            variance_tolerance=0.1,
+            seed=0,
+        )
+
+        with torch.no_grad():
+            output = model(torch.as_tensor(x))
+
+        self.assertEqual(tuple(output.shape), (len(x), 2))
+        self.assertEqual(count_layers(model), 3)
+        for variance in model.initial_variances:
+            self.assertLess(abs(variance - 1.0), 0.1)
 
     def test_djinn_sparse_fixed_keeps_zero_weights_zero(self):
         x, tree = self._tiny_classifier()

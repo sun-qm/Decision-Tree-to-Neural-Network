@@ -601,6 +601,105 @@ class MLPBaseline(nn.Module):
         return self.layers(x)
 
 
+class LSUVNetwork(nn.Module):
+    """Parameter-matched MLP with layer-sequential unit-variance initialization."""
+
+    def __init__(
+        self,
+        n_features: int,
+        output_dim: int,
+        *,
+        width: int,
+        calibration_x: np.ndarray,
+        variance_tolerance: float = 0.1,
+        max_trials: int = 10,
+        calibration_batch_size: int = 256,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        if len(calibration_x) == 0:
+            raise ValueError("LSUV requires a non-empty calibration batch")
+        if variance_tolerance <= 0.0 or max_trials <= 0:
+            raise ValueError("LSUV tolerance and max_trials must be positive")
+        set_all_seeds(seed)
+        self.layers = nn.ModuleList(
+            [
+                nn.Linear(n_features, width),
+                nn.Linear(width, width),
+                nn.Linear(width, output_dim),
+            ]
+        )
+        with torch.no_grad():
+            for layer in self.layers:
+                nn.init.orthogonal_(layer.weight)
+                layer.bias.zero_()
+
+        rng = np.random.default_rng(seed)
+        batch_size = min(calibration_batch_size, len(calibration_x))
+        indices = rng.choice(len(calibration_x), size=batch_size, replace=False)
+        batch = torch.as_tensor(calibration_x[indices], dtype=torch.float32)
+        self.initial_variances = self._unit_variance_initialize(
+            batch,
+            tolerance=variance_tolerance,
+            max_trials=max_trials,
+        )
+
+    def _output_at_layer(self, x: torch.Tensor, target_layer: int) -> torch.Tensor:
+        out = x
+        for layer_id, layer in enumerate(self.layers):
+            out = layer(out)
+            if layer_id == target_layer:
+                return out
+            out = F.relu(out)
+        raise IndexError(target_layer)
+
+    def _unit_variance_initialize(
+        self,
+        batch: torch.Tensor,
+        *,
+        tolerance: float,
+        max_trials: int,
+    ) -> list[float]:
+        variances: list[float] = []
+        with torch.no_grad():
+            for layer_id, layer in enumerate(self.layers):
+                for _ in range(max_trials):
+                    output = self._output_at_layer(batch, layer_id)
+                    variance = float(output.var(unbiased=False).item())
+                    if not math.isfinite(variance) or variance <= 1e-12:
+                        break
+                    if abs(variance - 1.0) < tolerance:
+                        break
+                    layer.weight.div_(math.sqrt(variance))
+                final_output = self._output_at_layer(batch, layer_id)
+                variances.append(float(final_output.var(unbiased=False).item()))
+        return variances
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for layer in self.layers[:-1]:
+            out = F.relu(layer(out))
+        return self.layers[-1](out)
+
+
+def make_lsuv(
+    n_features: int,
+    output_dim: int,
+    *,
+    width: int,
+    calibration_x: np.ndarray,
+    seed: int = 0,
+) -> LSUVNetwork:
+    """Build a parameter-matched MLP and initialize it with LSUV."""
+    return LSUVNetwork(
+        n_features,
+        output_dim,
+        width=width,
+        calibration_x=calibration_x,
+        seed=seed,
+    )
+
+
 class NeuralEnsemble(nn.Module):
     """Average an ensemble of neural models."""
 
@@ -845,6 +944,108 @@ def make_tbnn(
         perturbation=perturbation,
         seed=seed,
     )
+
+
+class KBANNNetwork(nn.Module):
+    """Towell-Shavlik knowledge-based ANN initialized from tree-derived rules.
+
+    Each decision-tree branch test is treated as a propositional supporting
+    fact, each root-to-leaf rule becomes a conjunctive hidden unit, and class
+    units implement disjunction. Rule links use the paper's strong weight and
+    all additional links begin near zero so backpropagation can refine them.
+    """
+
+    def __init__(
+        self,
+        estimator: Any,
+        *,
+        output_dim: int,
+        omega: float = 4.0,
+        condition_strength: float = 20.0,
+        perturbation: float = 1e-3,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        if not isinstance(estimator, DecisionTreeClassifier):
+            raise TypeError("KBANN requires a fitted DecisionTreeClassifier")
+        if omega <= 0.0 or condition_strength <= 0.0:
+            raise ValueError("omega and condition_strength must be positive")
+        if perturbation < 0.0:
+            raise ValueError("perturbation must be non-negative")
+
+        set_all_seeds(seed)
+        self.task = "classification"
+        self.output_dim = output_dim
+        self.paths = extract_sklearn_paths(
+            estimator, task="classification", output_dim=output_dim
+        )
+        self.condition_strength = float(condition_strength)
+        self.num_branch_facts = 2 * len(self.paths.node_features)
+        self.num_fact_units = self.num_branch_facts + self.paths.n_features
+        self.rule_layer = nn.Linear(self.num_fact_units, self.paths.leaf_count)
+        self.output_layer = nn.Linear(self.paths.leaf_count, output_dim)
+        self._initialize_from_rules(float(omega), perturbation, seed)
+
+    def _initialize_from_rules(
+        self,
+        omega: float,
+        perturbation: float,
+        seed: int,
+    ) -> None:
+        leaf_classes = self.paths.leaf_outputs.argmax(axis=1)
+        with torch.no_grad():
+            self.rule_layer.weight.zero_()
+            self.rule_layer.bias.zero_()
+            self.output_layer.weight.zero_()
+            self.output_layer.bias.fill_(-0.5 * omega)
+
+            for leaf, path in enumerate(self.paths.paths):
+                if path:
+                    facts = [2 * node_idx + branch for node_idx, branch in path]
+                    self.rule_layer.weight[leaf, facts] = omega
+                    self.rule_layer.bias[leaf] = -(len(path) - 0.5) * omega
+                else:
+                    self.rule_layer.bias[leaf] = 0.5 * omega
+
+            for output in range(self.output_dim):
+                rules = np.flatnonzero(leaf_classes == output).tolist()
+                self.output_layer.weight[output, rules] = omega
+
+            if perturbation:
+                generator = torch.Generator(device=self.rule_layer.weight.device)
+                generator.manual_seed(seed)
+                for parameter in self.parameters():
+                    noise = torch.empty_like(parameter).uniform_(
+                        -perturbation, perturbation, generator=generator
+                    )
+                    parameter.add_(noise)
+
+    def supporting_facts(self, x: torch.Tensor) -> torch.Tensor:
+        if len(self.paths.node_features) == 0:
+            return x
+        selected = x[:, torch.as_tensor(self.paths.node_features, device=x.device)]
+        thresholds = torch.as_tensor(
+            self.paths.node_thresholds, dtype=x.dtype, device=x.device
+        )
+        left = torch.sigmoid(self.condition_strength * (thresholds - selected))
+        right = 1.0 - left
+        branch_facts = torch.stack((left, right), dim=2).reshape(len(x), -1)
+        return torch.cat((branch_facts, x), dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        facts = self.supporting_facts(x)
+        rules = torch.sigmoid(self.rule_layer(facts))
+        return torch.sigmoid(self.output_layer(rules))
+
+
+def make_kbann(
+    estimator: Any,
+    *,
+    output_dim: int,
+    seed: int = 0,
+) -> KBANNNetwork:
+    """Build a KBANN from the propositional rules of a fitted tree."""
+    return KBANNNetwork(estimator, output_dim=output_dim, seed=seed)
 
 
 class PBNNNetwork(nn.Module):
@@ -1138,7 +1339,17 @@ def count_neurons(model: nn.Module) -> int:
     if isinstance(model, NeuralEnsemble):
         return sum(count_neurons(member) for member in model.members)
     if isinstance(model, TBNNNetwork):
-        return (len(model.interval_features) + model.and_layer.out_features + model.or_layer.out_features)
+        return (
+            len(model.interval_features)
+            + model.and_layer.out_features
+            + model.or_layer.out_features
+        )
+    if isinstance(model, KBANNNetwork):
+        return (
+            model.num_fact_units
+            + model.rule_layer.out_features
+            + model.output_layer.out_features
+        )
     if isinstance(model, PBNNNetwork):
         return (
             len(model.active_interval_indices)
@@ -1159,7 +1370,7 @@ def count_layers(model: nn.Module) -> int:
         return len(model.layers)
     if isinstance(model, NeuralEnsemble):
         return sum(count_layers(member) for member in model.members)
-    if isinstance(model, (TBNNNetwork, PBNNNetwork)):
+    if isinstance(model, (TBNNNetwork, KBANNNetwork, PBNNNetwork)):
         return 3
     return sum(1 for module in model.modules() if isinstance(module, nn.Linear))
 
@@ -1317,6 +1528,7 @@ def make_model(
     alpha: float | None,
     seed: int,
     param_target: int | None = None,
+    calibration_x: np.ndarray | None = None,
 ) -> nn.Module:
     paths = extract_sklearn_paths(estimator, task=task, output_dim=output_dim)
     if model_name == "coexplain_soft":
@@ -1340,6 +1552,19 @@ def make_model(
     if model_name == "mlp":
         width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
         return MLPBaseline(paths.n_features, output_dim, width=width, seed=seed)
+    if model_name == "lsuv":
+        if calibration_x is None:
+            raise ValueError(
+                "LSUV requires calibration_x for unit-variance initialization"
+            )
+        width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
+        return make_lsuv(
+            paths.n_features,
+            output_dim,
+            width=width,
+            calibration_x=calibration_x,
+            seed=seed,
+        )
     if model_name == "tbnn":
         if task != "classification":
             raise ValueError(
@@ -1351,6 +1576,10 @@ def make_model(
         if task != "classification":
             raise ValueError("The Setiono-Leow PBNN baseline is classification-only.")
         return make_pbnn(estimator, output_dim=output_dim, seed=seed)
+    if model_name == "kbann":
+        if task != "classification":
+            raise ValueError("The Towell-Shavlik KBANN baseline is classification-only.")
+        return make_kbann(estimator, output_dim=output_dim, seed=seed)
     raise ValueError(f"unknown neural model: {model_name}")
 
 
@@ -1547,7 +1776,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 for model_name in args.models:
                     if model_name == "source_tree":
                         continue
-                    if model_name in {"tbnn", "pbnn"} and task != "classification":
+                    if (
+                        model_name in {"tbnn", "pbnn", "kbann"}
+                        and task != "classification"
+                    ):
                         if getattr(args, "verbose", False):
                             print(
                                 f"      [skip] {model_name} is classification-only",
@@ -1574,7 +1806,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             continue
                         members = []
                         param_target = None
-                        if model_name == "mlp":
+                        if model_name in {"mlp", "lsuv"}:
                             ref = make_model(
                                 "coexplain_soft",
                                 task=task,
@@ -1597,6 +1829,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                                     alpha=alpha,
                                     seed=split_seed * 1000 + tree_id,
                                     param_target=param_target,
+                                    calibration_x=x_train_s,
                                 )
                             )
                         model: nn.Module = (
@@ -1866,7 +2099,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["source_tree", "coexplain_soft", "same_arch_random", "djinn", "path_expansion", "mlp", "tbnn", "pbnn"],
+        default=[
+            "source_tree",
+            "coexplain_soft",
+            "same_arch_random",
+            "djinn",
+            "path_expansion",
+            "mlp",
+            "lsuv",
+            "tbnn",
+            "pbnn",
+            "kbann",
+        ],
     )
     parser.add_argument("--alphas", nargs="+", type=float, default=[5.0, 20.0])
     parser.add_argument("--split-seeds", nargs="+", type=int, default=[0])
