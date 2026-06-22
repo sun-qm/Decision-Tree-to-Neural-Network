@@ -623,38 +623,228 @@ class NeuralEnsemble(nn.Module):
                 apply_constraints()
 
 
-class TBNN(nn.Module):
-    """
-    Tree-Based Neural Network (Ivanova & Kubat style simplified version)
+class TBNNNetwork(nn.Module):
+    """Ivanova-Kubat tree-based neural network (TBNN) initialization.
+
+    This implements the three-layer interval/AND/OR construction and the
+    initialization in Equations (3), (4), (6), and (7) of the attached paper.
+    TBNN is a classification method; the paper does not define a regression
+    analogue.
     """
 
-    def __init__(self, estimator, task, output_dim, seed=0):
+    def __init__(
+        self,
+        estimator: Any,
+        *,
+        output_dim: int,
+        activation_level: float = 0.99,
+        sigmoid_slope: float = 10.0,
+        epsilon: float = 1e-4,
+        perturbation: float = 1e-3,
+        seed: int = 0,
+    ) -> None:
         super().__init__()
+        if not isinstance(estimator, DecisionTreeClassifier):
+            raise TypeError("TBNN requires a fitted DecisionTreeClassifier")
+        if not 0.5 < activation_level < 1.0:
+            raise ValueError("activation_level must lie strictly between 0.5 and 1")
+        if sigmoid_slope <= 0.0:
+            raise ValueError("sigmoid_slope must be positive")
+        if epsilon < 0.0 or perturbation < 0.0:
+            raise ValueError("epsilon and perturbation must be non-negative")
+
         set_all_seeds(seed)
+        self.task = "classification"
+        self.output_dim = output_dim
+        self.activation_level = float(activation_level)
+        self.sigmoid_slope = float(sigmoid_slope)
+        self.epsilon = float(epsilon)
 
-        self.task = task
+        paths = extract_sklearn_paths(estimator, task="classification", output_dim=output_dim)
+        interval_features, interval_centers, interval_widths, feature_intervals = (
+            self._make_intervals(paths)
+        )
+        regular_rules = self._make_leaf_rules(paths, interval_centers, feature_intervals)
+        leaf_classes = paths.leaf_outputs.argmax(axis=1)
 
-        # 1. extract tree structure
-        self.paths = extract_sklearn_paths(
-            estimator,
-            task=task,
-            output_dim=output_dim
+        self.register_buffer(
+            "interval_features", torch.as_tensor(interval_features, dtype=torch.long)
+        )
+        self.register_buffer(
+            "interval_centers", torch.as_tensor(interval_centers, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "interval_widths", torch.as_tensor(interval_widths, dtype=torch.float32)
+        )
+        self.and_layer = nn.Linear(len(interval_features), paths.leaf_count)
+        self.or_layer = nn.Linear(paths.leaf_count, output_dim)
+        self._initialize_layers(regular_rules, leaf_classes, perturbation, seed)
+
+    @staticmethod
+    def _make_intervals(
+        paths: SklearnTreePaths,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, list[int]]]:
+        """Partition each used feature's scaled [0, 1] range at tree cuts."""
+        interval_features: list[int] = []
+        centers: list[float] = []
+        widths: list[float] = []
+        feature_intervals: dict[int, list[int]] = {}
+        for feature in sorted(set(int(f) for f in paths.node_features)):
+            cuts = sorted(
+                set(
+                    float(np.clip(t, 0.0, 1.0))
+                    for f, t in zip(paths.node_features, paths.node_thresholds)
+                    if int(f) == feature and 0.0 < float(t) < 1.0
+                )
+            )
+            bounds = [0.0, *cuts, 1.0]
+            indices: list[int] = []
+            for low, high in zip(bounds[:-1], bounds[1:]):
+                if high <= low:
+                    continue
+                indices.append(len(interval_features))
+                interval_features.append(feature)
+                centers.append((low + high) / 2.0)
+                widths.append(high - low)
+            feature_intervals[feature] = indices
+        return (
+            np.asarray(interval_features, dtype=np.int64),
+            np.asarray(centers, dtype=np.float32),
+            np.asarray(widths, dtype=np.float32),
+            feature_intervals,
         )
 
-        # 2. build same structure as SoftTreeNetwork
-        self.model = SoftTreeNetwork(
-            self.paths,
-            alpha=5.0,              # paper-style sharpness
-            mode="editable",
-            seed=seed
-        )
+    @staticmethod
+    def _make_leaf_rules(
+        paths: SklearnTreePaths,
+        interval_centers: np.ndarray,
+        feature_intervals: dict[int, list[int]],
+    ) -> list[tuple[list[int], list[int]]]:
+        """Reduce every root-to-leaf path to positive/negated interval literals."""
+        rules: list[tuple[list[int], list[int]]] = []
+        for path in paths.paths:
+            bounds = {feature: [-np.inf, np.inf] for feature in feature_intervals}
+            for node_idx, branch in path:
+                feature = int(paths.node_features[node_idx])
+                threshold = float(paths.node_thresholds[node_idx])
+                if branch == 0:
+                    bounds[feature][1] = min(bounds[feature][1], threshold)
+                else:
+                    bounds[feature][0] = max(bounds[feature][0], threshold)
 
-        # 3. optional: small refinement layer (paper idea = extra links)
-        self.refine = nn.Linear(output_dim, output_dim)
+            positive: list[int] = []
+            negative: list[int] = []
+            for feature, indices in feature_intervals.items():
+                low, high = bounds[feature]
+                if np.isneginf(low) and np.isposinf(high):
+                    continue
+                allowed = [
+                    idx for idx in indices
+                    if interval_centers[idx] > low and interval_centers[idx] <= high
+                ]
+                if len(allowed) == 1:
+                    positive.append(allowed[0])
+                else:
+                    negative.extend(idx for idx in indices if idx not in allowed)
+            rules.append((positive, negative))
+        return rules
 
-    def forward(self, x):
-        out = self.model(x)
-        return self.refine(out)
+    def _initialize_layers(
+        self,
+        rules: list[tuple[list[int], list[int]]],
+        leaf_classes: np.ndarray,
+        perturbation: float,
+        seed: int,
+    ) -> None:
+        a = self.activation_level
+        h = self.sigmoid_slope
+        eps = self.epsilon
+        psi = math.log(a / (1.0 - a)) / h
+
+        with torch.no_grad():
+            self.and_layer.weight.fill_(eps)
+            self.or_layer.weight.fill_(eps)
+
+            for leaf, (positive, negative) in enumerate(rules):
+                n, m = len(positive), len(negative)
+                regular = n + m
+                k = self.and_layer.in_features - regular
+                if regular == 0:
+                    self.and_layer.bias[leaf] = psi
+                    continue
+                denominator = a * (regular + 1) - regular
+                if denominator <= 0.0:
+                    raise ValueError(
+                        "activation_level is too small for this tree; increase it "
+                        f"above {regular / (regular + 1):.6f}"
+                    )
+                weight = 2.0 * (psi + k * eps) / denominator
+                threshold = (psi + k * eps) * (
+                    a * (regular - 1) + (n - m)
+                ) / denominator
+                self.and_layer.weight[leaf, positive] = weight
+                self.and_layer.weight[leaf, negative] = -weight
+                self.and_layer.bias[leaf] = -threshold
+
+            for output in range(self.output_dim):
+                regular = np.flatnonzero(leaf_classes == output).tolist()
+                n = len(regular)
+                k = self.or_layer.in_features - n
+                if n == 0:
+                    self.or_layer.bias[output] = -psi
+                    continue
+                denominator = a * (n + 1) - n
+                if denominator <= 0.0:
+                    raise ValueError(
+                        "activation_level is too small for the number of leaves in a class"
+                    )
+                weight = 2.0 * (psi + k * eps) / denominator
+                threshold = (psi + k * eps) * (n - a * (n - 1)) / denominator
+                self.or_layer.weight[output, regular] = weight
+                self.or_layer.bias[output] = -threshold
+
+            if perturbation:
+                generator = torch.Generator(device=self.and_layer.weight.device)
+                generator.manual_seed(seed)
+                for weight in (self.and_layer.weight, self.or_layer.weight):
+                    noise = torch.empty_like(weight).uniform_(
+                        -perturbation, perturbation, generator=generator
+                    )
+                    weight.add_(noise)
+
+    def interval_memberships(self, x: torch.Tensor) -> torch.Tensor:
+        selected = x[:, self.interval_features]
+        closeness = (
+            self.interval_widths - 2.0 * torch.abs(selected - self.interval_centers)
+        ) / (2.0 * self.interval_widths)
+        return torch.sigmoid(self.sigmoid_slope * closeness)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        intervals = self.interval_memberships(x)
+        conjunctions = torch.sigmoid(self.sigmoid_slope * self.and_layer(intervals))
+        return torch.sigmoid(self.sigmoid_slope * self.or_layer(conjunctions))
+
+
+def make_tbnn(
+    estimator: Any,
+    *,
+    output_dim: int,
+    activation_level: float = 0.99,
+    sigmoid_slope: float = 10.0,
+    epsilon: float = 1e-4,
+    perturbation: float = 1e-3,
+    seed: int = 0,
+) -> TBNNNetwork:
+    """Build a paper-method TBNN baseline from a fitted classification tree."""
+    return TBNNNetwork(
+        estimator,
+        output_dim=output_dim,
+        activation_level=activation_level,
+        sigmoid_slope=sigmoid_slope,
+        epsilon=epsilon,
+        perturbation=perturbation,
+        seed=seed,
+    )
 
 
 def count_parameters(model: nn.Module) -> tuple[int, int]:
@@ -867,7 +1057,12 @@ def make_model(
         width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
         return MLPBaseline(paths.n_features, output_dim, width=width, seed=seed)
     if model_name == "tbnn":
-        return TBNN(estimator, task=task, output_dim=output_dim, seed=seed)
+        if task != "classification":
+            raise ValueError(
+                "The Ivanova-Kubat TBNN baseline is classification-only; "
+                "the paper does not specify a regression mapping."
+            )
+        return make_tbnn(estimator, output_dim=output_dim, seed=seed)
     raise ValueError(f"unknown neural model: {model_name}")
 
 
