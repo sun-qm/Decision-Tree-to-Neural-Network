@@ -863,6 +863,8 @@ def count_neurons(model: nn.Module) -> int:
         return sum(layer.out_features for layer in model.layers)
     if isinstance(model, NeuralEnsemble):
         return sum(count_neurons(member) for member in model.members)
+    if isinstance(model, TBNNNetwork):
+        return (len(model.interval_features) + model.and_layer.out_features + model.or_layer.out_features)
     total = 0
     for module in model.modules():
         if isinstance(module, nn.Linear):
@@ -1258,6 +1260,10 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 estimators = source_estimators(source)
                 for model_name in args.models:
                     if model_name == "source_tree":
+                        continue
+                    if model_name == "tbnn" and task != "classification":
+                        if getattr(args, "verbose", False):
+                            print("      [skip] tbnn is classification-only", flush=True)
                         continue
                     alpha_values: list[float | None] = (
                         list(args.alphas)
