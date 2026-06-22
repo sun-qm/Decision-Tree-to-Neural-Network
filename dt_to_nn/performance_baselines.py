@@ -267,6 +267,155 @@ class SoftTreeNetwork(nn.Module):
         return path_values @ self.leaf_outputs
 
 
+class CoExplainZeroPaddedNetwork(nn.Module):
+    """Dense zero-padded soft parser following the Editable-XAI enhancement idea.
+
+    The tree-derived connections are initialized explicitly, while all other
+    dense matrix entries start at zero and are trainable. During optimization,
+    those zero entries may become nonzero, which is the "zero padding" capacity
+    used by the enhanced parsed network.
+    """
+
+    def __init__(
+        self,
+        paths: SklearnTreePaths,
+        *,
+        alpha: float,
+        zero_padding_width: int = 8,
+        zero_padding_layers: int = 1,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        set_all_seeds(seed)
+        self.paths = paths
+        self.task = paths.task
+        self.zero_padding_width = zero_padding_width
+        self.zero_padding_layers = zero_padding_layers
+        weights, biases, activations = self._initial_matrices(
+            paths,
+            alpha=alpha,
+            zero_padding_width=zero_padding_width,
+            zero_padding_layers=zero_padding_layers,
+        )
+        self.activations = activations
+        self.layers = nn.ModuleList()
+        for weight, bias in zip(weights, biases):
+            layer = nn.Linear(weight.shape[1], weight.shape[0])
+            with torch.no_grad():
+                layer.weight.copy_(torch.as_tensor(weight, dtype=torch.float32))
+                layer.bias.copy_(torch.as_tensor(bias, dtype=torch.float32))
+            self.layers.append(layer)
+
+    @staticmethod
+    def _initial_matrices(
+        paths: SklearnTreePaths,
+        *,
+        alpha: float,
+        zero_padding_width: int,
+        zero_padding_layers: int,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[str]]:
+        n_internal = len(paths.node_features)
+        condition_width = 2 * n_internal + zero_padding_width
+        weights: list[np.ndarray] = []
+        biases: list[np.ndarray] = []
+        activations: list[str] = []
+
+        w_condition = np.zeros((condition_width, paths.n_features), dtype=np.float32)
+        b_condition = np.zeros(condition_width, dtype=np.float32)
+        for idx, (feature, threshold) in enumerate(
+            zip(paths.node_features, paths.node_thresholds)
+        ):
+            left_row = 2 * idx
+            right_row = 2 * idx + 1
+            w_condition[left_row, int(feature)] = -float(alpha)
+            b_condition[left_row] = float(alpha * threshold)
+            w_condition[right_row, int(feature)] = float(alpha)
+            b_condition[right_row] = float(-alpha * threshold)
+        weights.append(w_condition)
+        biases.append(b_condition)
+        activations.append("sigmoid")
+
+        max_depth = max((len(path) for path in paths.paths), default=0)
+        total_path_layers = max_depth + zero_padding_layers
+        if total_path_layers == 0:
+            w_out = np.zeros((paths.output_dim, condition_width), dtype=np.float32)
+            b_out = np.asarray(paths.leaf_outputs[0], dtype=np.float32)
+            weights.append(w_out)
+            biases.append(b_out)
+            activations.append("identity")
+            return weights, biases, activations
+
+        path_slots_by_depth: list[dict[tuple[tuple[int, int], ...], int]] = []
+        for depth in range(1, total_path_layers + 1):
+            prefixes: list[tuple[tuple[int, int], ...]] = []
+            for path in paths.paths:
+                if not path:
+                    prefixes.append(())
+                elif depth <= len(path):
+                    prefixes.append(path[:depth])
+                else:
+                    prefixes.append(path)
+            ordered = sorted(set(prefixes), key=lambda item: (len(item), item))
+            path_slots_by_depth.append({prefix: idx for idx, prefix in enumerate(ordered)})
+
+        prev_width = condition_width
+        for depth, slots in enumerate(path_slots_by_depth, start=1):
+            path_offset = condition_width
+            width = condition_width + len(slots) + zero_padding_width
+            w = np.zeros((width, prev_width), dtype=np.float32)
+            b = np.zeros(width, dtype=np.float32)
+            for row in range(condition_width):
+                if row < prev_width:
+                    w[row, row] = 1.0
+            for prefix, row in slots.items():
+                row = path_offset + row
+                if not prefix:
+                    b[row] = 1.0
+                    continue
+                if depth == 1:
+                    node_idx, branch = prefix[-1]
+                    w[row, 2 * node_idx + branch] = 1.0
+                elif depth <= len(prefix):
+                    parent = prefix[:-1]
+                    parent_col = path_offset + path_slots_by_depth[depth - 2][parent]
+                    node_idx, branch = prefix[-1]
+                    w[row, parent_col] = 1.0
+                    w[row, 2 * node_idx + branch] = 1.0
+                    b[row] = -1.0
+                else:
+                    parent_col = path_offset + path_slots_by_depth[depth - 2][prefix]
+                    w[row, parent_col] = 1.0
+            weights.append(w)
+            biases.append(b)
+            activations.append("relu")
+            prev_width = width
+
+        final_slots = path_slots_by_depth[-1]
+        w_out = np.zeros((paths.output_dim, prev_width), dtype=np.float32)
+        b_out = np.zeros(paths.output_dim, dtype=np.float32)
+        for path, leaf_output in zip(paths.paths, paths.leaf_outputs):
+            col = condition_width + final_slots[path]
+            w_out[:, col] += leaf_output
+        weights.append(w_out)
+        biases.append(b_out)
+        activations.append("identity")
+        return weights, biases, activations
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for layer, activation in zip(self.layers, self.activations):
+            out = layer(out)
+            if activation == "sigmoid":
+                out = torch.sigmoid(out)
+            elif activation == "relu":
+                out = F.relu(out)
+            elif activation == "identity":
+                pass
+            else:  # pragma: no cover
+                raise ValueError(f"unknown activation: {activation}")
+        return out
+
+
 class DJINNLikeNetwork(nn.Module):
     """PyTorch implementation of the LLNL DJINN tree-to-architecture mapping."""
 
@@ -408,6 +557,32 @@ class DJINNLikeNetwork(nn.Module):
         return self.layers[-1](out)
 
 
+class DJINNSparseFixedNetwork(DJINNLikeNetwork):
+    """DJINN-like model where initially zero weights are constrained to stay zero."""
+
+    def __init__(
+        self,
+        estimator: Any,
+        *,
+        task: Task,
+        output_dim: int,
+        seed: int = 0,
+    ) -> None:
+        super().__init__(estimator, task=task, output_dim=output_dim, seed=seed)
+        self.weight_masks: list[torch.Tensor] = []
+        for layer in self.layers:
+            mask = layer.weight.detach().ne(0.0).float()
+            self.register_buffer(f"_weight_mask_{len(self.weight_masks)}", mask)
+            self.weight_masks.append(mask)
+            layer.weight.register_hook(lambda grad, m=mask: grad * m)
+        self.apply_constraints()
+
+    def apply_constraints(self) -> None:
+        with torch.no_grad():
+            for layer, mask in zip(self.layers, self.weight_masks):
+                layer.weight.mul_(mask)
+
+
 class MLPBaseline(nn.Module):
     """Simple parameter-matched MLP baseline."""
 
@@ -440,6 +615,12 @@ class NeuralEnsemble(nn.Module):
             probs = torch.softmax(outputs, dim=2).mean(dim=0)
             return torch.log(torch.clamp(probs, min=1e-8))
         return outputs.mean(dim=0)
+
+    def apply_constraints(self) -> None:
+        for member in self.members:
+            apply_constraints = getattr(member, "apply_constraints", None)
+            if callable(apply_constraints):
+                apply_constraints()
 
 
 class TBNN(nn.Module):
@@ -488,6 +669,8 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
 def count_neurons(model: nn.Module) -> int:
     if isinstance(model, SoftTreeNetwork):
         return len(model.paths.node_features) + model.paths.leaf_count + model.paths.output_dim
+    if isinstance(model, CoExplainZeroPaddedNetwork):
+        return sum(layer.out_features for layer in model.layers)
     if isinstance(model, NeuralEnsemble):
         return sum(count_neurons(member) for member in model.members)
     total = 0
@@ -500,6 +683,8 @@ def count_neurons(model: nn.Module) -> int:
 def count_layers(model: nn.Module) -> int:
     if isinstance(model, SoftTreeNetwork):
         return 3
+    if isinstance(model, CoExplainZeroPaddedNetwork):
+        return len(model.layers)
     if isinstance(model, NeuralEnsemble):
         return sum(count_layers(member) for member in model.members)
     return sum(1 for module in model.modules() if isinstance(module, nn.Linear))
@@ -543,6 +728,9 @@ def train_model(
             loss = F.cross_entropy(pred, ytr[batch]) if task == "classification" else F.mse_loss(pred, ytr[batch])
             loss.backward()
             optimizer.step()
+            apply_constraints = getattr(model, "apply_constraints", None)
+            if callable(apply_constraints):
+                apply_constraints()
 
         model.eval()
         with torch.no_grad():
@@ -659,12 +847,22 @@ def make_model(
     paths = extract_sklearn_paths(estimator, task=task, output_dim=output_dim)
     if model_name == "coexplain_soft":
         return SoftTreeNetwork(paths, alpha=float(alpha), mode="editable", seed=seed)
+    if model_name == "coexplain_soft_zero_padded":
+        return CoExplainZeroPaddedNetwork(
+            paths,
+            alpha=float(alpha),
+            zero_padding_width=8,
+            zero_padding_layers=1,
+            seed=seed,
+        )
     if model_name == "same_arch_random":
         return SoftTreeNetwork(paths, alpha=float(alpha or 1.0), mode="editable", random_init=True, seed=seed)
     if model_name == "path_expansion":
         return SoftTreeNetwork(paths, alpha=float(alpha), mode="path_expansion", seed=seed)
     if model_name == "djinn":
         return DJINNLikeNetwork(estimator, task=task, output_dim=output_dim, seed=seed)
+    if model_name == "djinn_sparse_fixed":
+        return DJINNSparseFixedNetwork(estimator, task=task, output_dim=output_dim, seed=seed)
     if model_name == "mlp":
         width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
         return MLPBaseline(paths.n_features, output_dim, width=width, seed=seed)
@@ -714,6 +912,13 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: Sequence[str])
             writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
+def read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 def summarize_runs(rows: list[dict[str, Any]], *, task: Task) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
@@ -748,6 +953,23 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     per_epoch: list[dict[str, Any]] = []
     per_run: list[dict[str, Any]] = []
     model_size: list[dict[str, Any]] = []
+    completed: set[tuple[str, str, str, str, str]] = set()
+    if getattr(args, "resume", False):
+        per_epoch = read_csv_rows(raw_dir / "per_epoch_metrics.csv")
+        per_run = read_csv_rows(raw_dir / "per_run_summary.csv")
+        model_size = read_csv_rows(raw_dir / "model_size_summary.csv")
+        for row in per_run:
+            completed.add(
+                (
+                    str(row.get("dataset", "")),
+                    str(row.get("split_seed", "")),
+                    str(row.get("setting", "")),
+                    str(row.get("model_name", "")),
+                    str(row.get("alpha", "")),
+                )
+            )
+        if getattr(args, "verbose", False):
+            print(f"[resume] loaded {len(completed)} completed run rows", flush=True)
 
     def maybe_flush() -> None:
         if getattr(args, "stream_results", False):
@@ -821,19 +1043,22 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
                 if "source_tree" in args.models:
-                    metrics = (
-                        classification_summary_from_probs(y_test, source.predict_proba(x_test_s))
-                        if task == "classification"
-                        else regression_summary(y_test, source_test_pred)
-                    )
-                    per_run.append(
-                        base_run_row(
-                            dataset, task, split_seed, setting, "source_tree", "", 0,
-                            metrics, metrics, None, None, 0.0,
+                    run_key = (dataset, str(split_seed), setting, "source_tree", "")
+                    if run_key not in completed:
+                        metrics = (
+                            classification_summary_from_probs(y_test, source.predict_proba(x_test_s))
+                            if task == "classification"
+                            else regression_summary(y_test, source_test_pred)
                         )
-                    )
-                    add_source_size(model_size, dataset, setting, source)
-                    maybe_flush()
+                        per_run.append(
+                            base_run_row(
+                                dataset, task, split_seed, setting, "source_tree", "", 0,
+                                metrics, metrics, None, None, 0.0,
+                            )
+                        )
+                        add_source_size(model_size, dataset, setting, source)
+                        completed.add(run_key)
+                        maybe_flush()
 
                 estimators = source_estimators(source)
                 for model_name in args.models:
@@ -841,10 +1066,22 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         continue
                     alpha_values: list[float | None] = (
                         list(args.alphas)
-                        if model_name in {"coexplain_soft", "same_arch_random", "path_expansion"}
+                        if model_name in {
+                            "coexplain_soft",
+                            "coexplain_soft_zero_padded",
+                            "same_arch_random",
+                            "path_expansion",
+                        }
                         else [None]
                     )
                     for alpha in alpha_values:
+                        alpha_key = "" if alpha is None else str(float(alpha))
+                        run_key = (dataset, str(split_seed), setting, model_name, alpha_key)
+                        if run_key in completed:
+                            if getattr(args, "verbose", False):
+                                alpha_text = "" if alpha is None else f" alpha={alpha}"
+                                print(f"      [skip] {model_name}{alpha_text}", flush=True)
+                            continue
                         members = []
                         param_target = None
                         if model_name == "mlp":
@@ -948,6 +1185,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         row["area_under_train_loss_curve"] = float(sum(h["train_loss"] for h in history))
                         row["area_under_val_loss_curve"] = float(sum(h["val_loss"] for h in history))
                         per_run.append(row)
+                        completed.add(run_key)
                         total_params, nonzero_params = count_parameters(model)
                         model_size.append(
                             {
@@ -1101,7 +1339,12 @@ def write_outputs(
 
 
 def select_alpha_rows(per_run: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    alpha_models = {"coexplain_soft", "same_arch_random", "path_expansion"}
+    alpha_models = {
+        "coexplain_soft",
+        "coexplain_soft_zero_padded",
+        "same_arch_random",
+        "path_expansion",
+    }
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in per_run:
         if row.get("model_name") not in alpha_models:
@@ -1145,6 +1388,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-dataset-cap", action="store_true")
     parser.add_argument("--stream-results", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 
 
