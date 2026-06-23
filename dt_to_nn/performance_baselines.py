@@ -601,6 +601,60 @@ class MLPBaseline(nn.Module):
         return self.layers(x)
 
 
+class XavierMLPBaseline(MLPBaseline):
+    """Parameter-matched ReLU MLP with Glorot-Bengio initialization.
+
+    Every weight matrix is sampled from
+    U[-sqrt(6 / (fan_in + fan_out)), sqrt(6 / (fan_in + fan_out))],
+    and every bias is initialized to zero (Glorot & Bengio, 2010, Eq. 16).
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        output_dim: int,
+        *,
+        width: int,
+        seed: int,
+    ) -> None:
+        super().__init__(n_features, output_dim, width=width, seed=seed)
+        set_all_seeds(seed)
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(
+                        module.weight
+                    )
+                    bound = math.sqrt(6.0 / (fan_in + fan_out))
+                    module.weight.uniform_(-bound, bound)
+                    module.bias.zero_()
+
+
+class HeMLPBaseline(MLPBaseline):
+    """Parameter-matched ReLU MLP with He et al. initialization.
+
+    Every weight is sampled from N(0, 2 / fan_in), equivalently with
+    standard deviation sqrt(2 / fan_in), and every bias is zero.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        output_dim: int,
+        *,
+        width: int,
+        seed: int,
+    ) -> None:
+        super().__init__(n_features, output_dim, width=width, seed=seed)
+        set_all_seeds(seed)
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
+                    module.weight.normal_(mean=0.0, std=math.sqrt(2.0 / fan_in))
+                    module.bias.zero_()
+
+
 class NeuralEnsemble(nn.Module):
     """Average an ensemble of neural models."""
 
@@ -1552,6 +1606,22 @@ def make_model(
     if model_name == "mlp":
         width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
         return MLPBaseline(paths.n_features, output_dim, width=width, seed=seed)
+    if model_name == "xavier":
+        width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
+        return XavierMLPBaseline(
+            paths.n_features,
+            output_dim,
+            width=width,
+            seed=seed,
+        )
+    if model_name == "he":
+        width = choose_mlp_width(paths.n_features, output_dim, param_target or 0)
+        return HeMLPBaseline(
+            paths.n_features,
+            output_dim,
+            width=width,
+            seed=seed,
+        )
     if model_name == "lsuv":
         if calibration_x is None:
             raise ValueError(
@@ -1806,7 +1876,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             continue
                         members = []
                         param_target = None
-                        if model_name in {"mlp", "lsuv"}:
+                        if model_name in {"mlp", "xavier", "he", "lsuv"}:
                             ref = make_model(
                                 "coexplain_soft",
                                 task=task,
@@ -2106,6 +2176,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "djinn",
             "path_expansion",
             "mlp",
+            "xavier",
+            "he",
             "lsuv",
             "tbnn",
             "pbnn",
